@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/go-chi/chi/v5"
+	"github.com/gin-gonic/gin"
 	"github.com/spf13/viper"
 
 	"github.com/dhax/go-base/auth/jwt"
@@ -43,9 +43,10 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 
-	r := chi.NewRouter()
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
 	r.Use(logging.NewStructuredLogger(logging.NewLogger()))
-	r.Mount("/", auth.Router())
+	auth.Router(r.Group(""))
 
 	ts = httptest.NewServer(r)
 

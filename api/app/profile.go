@@ -3,12 +3,10 @@ package app
 import (
 	"context"
 	"errors"
-	"net/http"
 
 	"github.com/dhax/go-base/auth/jwt"
 	"github.com/dhax/go-base/models"
-	"github.com/go-chi/chi/v5"
-	"github.com/go-chi/render"
+	"github.com/gin-gonic/gin"
 	validation "github.com/go-ozzo/ozzo-validation"
 )
 
@@ -35,26 +33,25 @@ func NewProfileResource(store ProfileStore) *ProfileResource {
 	}
 }
 
-func (rs *ProfileResource) router() *chi.Mux {
-	r := chi.NewRouter()
+func (rs *ProfileResource) router(r *gin.RouterGroup) {
 	r.Use(rs.profileCtx)
-	r.Get("/", rs.get)
-	r.Put("/", rs.update)
-	return r
+	r.GET("", rs.get)
+	r.GET("/", rs.get)
+	r.PUT("", rs.update)
+	r.PUT("/", rs.update)
 }
 
-func (rs *ProfileResource) profileCtx(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		claims := jwt.ClaimsFromCtx(r.Context())
-		p, err := rs.Store.Get(claims.ID)
-		if err != nil {
-			log(r).WithField("profileCtx", claims.Sub).Error(err)
-			render.Render(w, r, ErrInternalServerError)
-			return
-		}
-		ctx := context.WithValue(r.Context(), ctxProfile, p)
-		next.ServeHTTP(w, r.WithContext(ctx))
-	})
+func (rs *ProfileResource) profileCtx(c *gin.Context) {
+	claims := jwt.ClaimsFromCtx(c.Request.Context())
+	p, err := rs.Store.Get(claims.ID)
+	if err != nil {
+		log(c.Request).WithField("profileCtx", claims.Sub).Error(err)
+		ErrInternalServerError.Render(c)
+		return
+	}
+	ctx := context.WithValue(c.Request.Context(), ctxProfile, p)
+	c.Request = c.Request.WithContext(ctx)
+	c.Next()
 }
 
 type profileRequest struct {
@@ -62,7 +59,7 @@ type profileRequest struct {
 	ProtectedID int `json:"id"`
 }
 
-func (d *profileRequest) Bind(r *http.Request) error {
+func (d *profileRequest) Bind(c *gin.Context) error {
 	return nil
 }
 
@@ -76,26 +73,26 @@ func newProfileResponse(p *models.Profile) *profileResponse {
 	}
 }
 
-func (rs *ProfileResource) get(w http.ResponseWriter, r *http.Request) {
-	p := r.Context().Value(ctxProfile).(*models.Profile)
-	render.Respond(w, r, newProfileResponse(p))
+func (rs *ProfileResource) get(c *gin.Context) {
+	p := c.Request.Context().Value(ctxProfile).(*models.Profile)
+	respond(c, newProfileResponse(p))
 }
 
-func (rs *ProfileResource) update(w http.ResponseWriter, r *http.Request) {
-	p := r.Context().Value(ctxProfile).(*models.Profile)
+func (rs *ProfileResource) update(c *gin.Context) {
+	p := c.Request.Context().Value(ctxProfile).(*models.Profile)
 	data := &profileRequest{Profile: p}
-	if err := render.Bind(r, data); err != nil {
-		render.Render(w, r, ErrInvalidRequest(err))
+	if err := bind(c, data); err != nil {
+		ErrInvalidRequest(err).Render(c)
 	}
 
 	if err := rs.Store.Update(p); err != nil {
 		switch err := err.(type) {
 		case validation.Errors:
-			render.Render(w, r, ErrValidation(ErrProfileValidation, err))
+			ErrValidation(ErrProfileValidation, err).Render(c)
 			return
 		}
-		render.Render(w, r, ErrRender(err))
+		ErrRender(err).Render(c)
 		return
 	}
-	render.Respond(w, r, newProfileResponse(p))
+	respond(c, newProfileResponse(p))
 }

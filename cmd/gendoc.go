@@ -4,9 +4,13 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"reflect"
+	"runtime"
+	"sort"
+	"strings"
 
 	"github.com/dhax/go-base/api"
-	"github.com/go-chi/docgen"
+	"github.com/gin-gonic/gin"
 	"github.com/spf13/cobra"
 )
 
@@ -46,16 +50,60 @@ func init() {
 	gendocCmd.Flags().BoolVarP(&routes, "routes", "r", false, "create api routes markdown file")
 }
 
+const projectPath = "github.com/dhax/go-base"
+
 func genRoutesDoc() {
 	api, _ := api.New(false)
 	fmt.Print("generating routes markdown file: ")
-	md := docgen.MarkdownRoutesDoc(api, docgen.MarkdownOpts{
-		ProjectPath: "github.com/dhax/go-base",
-		Intro:       "GoBase REST API.",
-	})
+	md := markdownRoutesDoc(api, projectPath, "GoBase REST API.")
 	if err := os.WriteFile("routes.md", []byte(md), 0644); err != nil {
 		log.Println(err)
 		return
 	}
 	fmt.Println("OK")
+}
+
+// markdownRoutesDoc renders the routes registered on the engine as a markdown document.
+func markdownRoutesDoc(engine *gin.Engine, projectPath, intro string) string {
+	routes := engine.Routes()
+	sort.Slice(routes, func(i, j int) bool {
+		if routes[i].Path != routes[j].Path {
+			return routes[i].Path < routes[j].Path
+		}
+		return routes[i].Method < routes[j].Method
+	})
+
+	var buf strings.Builder
+	fmt.Fprintf(&buf, "# %s\n\n%s\n\n## Routes\n\n", projectPath, intro)
+
+	for _, route := range routes {
+		fmt.Fprintf(&buf, "<details>\n<summary>`%s`</summary>\n\n", route.Path)
+		fmt.Fprintf(&buf, "- **%s**\n", route.Path)
+		fmt.Fprintf(&buf, "\t- _%s_\n", route.Method)
+		fmt.Fprintf(&buf, "\t\t- [%s](%s)\n", handlerName(route.Handler), handlerSource(route.HandlerFunc))
+		buf.WriteString("\n</details>\n")
+	}
+
+	fmt.Fprintf(&buf, "\nTotal # of routes: %d\n", len(routes))
+
+	return buf.String()
+}
+
+// handlerName strips the project path from a fully qualified handler symbol.
+func handlerName(handler string) string {
+	return strings.TrimPrefix(handler, projectPath+"/")
+}
+
+// handlerSource returns the project relative file and line a handler is defined at.
+func handlerSource(handler gin.HandlerFunc) string {
+	pc := reflect.ValueOf(handler).Pointer()
+	fn := runtime.FuncForPC(pc)
+	if fn == nil {
+		return ""
+	}
+	file, line := fn.FileLine(pc)
+	if idx := strings.LastIndex(file, projectPath); idx >= 0 {
+		file = file[idx+len(projectPath):]
+	}
+	return fmt.Sprintf("%s#L%d", file, line)
 }

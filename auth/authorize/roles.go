@@ -1,26 +1,22 @@
 package authorize
 
 import (
-	"net/http"
 	"slices"
 
-	"github.com/go-chi/render"
+	"github.com/gin-gonic/gin"
 
 	"github.com/dhax/go-base/auth/jwt"
 )
 
 // RequiresRole middleware restricts access to accounts having role parameter in their jwt claims.
-func RequiresRole(role string) func(next http.Handler) http.Handler {
-	return func(next http.Handler) http.Handler {
-		hfn := func(w http.ResponseWriter, r *http.Request) {
-			claims := jwt.ClaimsFromCtx(r.Context())
-			if !hasRole(role, claims.Roles) {
-				render.Render(w, r, ErrForbidden)
-				return
-			}
-			next.ServeHTTP(w, r)
+func RequiresRole(role string) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		claims := jwt.ClaimsFromCtx(c.Request.Context())
+		if !hasRole(role, claims.Roles) {
+			ErrForbidden.Render(c)
+			return
 		}
-		return http.HandlerFunc(hfn)
+		c.Next()
 	}
 }
 

@@ -7,15 +7,17 @@ import (
 	"github.com/sirupsen/logrus"
 	"github.com/uptrace/bun"
 
-	"github.com/go-chi/chi/v5"
+	"github.com/gin-gonic/gin"
 
 	"github.com/dhax/go-base/auth/authorize"
 	"github.com/dhax/go-base/database"
 	"github.com/dhax/go-base/logging"
 )
 
+// RoleAdmin is the role required to reach any admin route, including the ones that match
+// no handler: the guard runs before the not found response.
 const (
-	roleAdmin = "admin"
+	RoleAdmin = "admin"
 )
 
 type ctxKey int
@@ -40,18 +42,18 @@ func NewAPI(db *bun.DB) (*API, error) {
 	return api, nil
 }
 
-// Router provides admin application routes.
-func (a *API) Router() *chi.Mux {
-	r := chi.NewRouter()
-	r.Use(authorize.RequiresRole(roleAdmin))
+// Router registers admin application routes on the given router group.
+func (a *API) Router(r *gin.RouterGroup) {
+	r.Use(authorize.RequiresRole(RoleAdmin))
 
-	r.Get("/", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("Hello Admin"))
-		log(r).Debug("admin access")
-	})
+	index := func(c *gin.Context) {
+		c.Writer.Write([]byte("Hello Admin"))
+		log(c.Request).Debug("admin access")
+	}
+	r.GET("", index)
+	r.GET("/", index)
 
-	r.Mount("/accounts", a.Accounts.router())
-	return r
+	a.Accounts.router(r.Group("/accounts"))
 }
 
 func log(r *http.Request) logrus.FieldLogger {

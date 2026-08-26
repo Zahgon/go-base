@@ -4,7 +4,7 @@ package app
 import (
 	"net/http"
 
-	"github.com/go-chi/chi/v5"
+	"github.com/gin-gonic/gin"
 	"github.com/sirupsen/logrus"
 	"github.com/uptrace/bun"
 
@@ -40,14 +40,10 @@ func NewAPI(db *bun.DB) (*API, error) {
 	return api, nil
 }
 
-// Router provides application routes.
-func (a *API) Router() *chi.Mux {
-	r := chi.NewRouter()
-
-	r.Mount("/account", a.Account.router())
-	r.Mount("/profile", a.Profile.router())
-
-	return r
+// Router registers application routes on the given router group.
+func (a *API) Router(r *gin.RouterGroup) {
+	a.Account.router(r.Group("/account"))
+	a.Profile.router(r.Group("/profile"))
 }
 
 func log(r *http.Request) logrus.FieldLogger {

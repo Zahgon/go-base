@@ -10,8 +10,7 @@ import (
 	"github.com/dhax/go-base/database"
 	validation "github.com/go-ozzo/ozzo-validation"
 
-	"github.com/go-chi/chi/v5"
-	"github.com/go-chi/render"
+	"github.com/gin-gonic/gin"
 )
 
 // The list of error types returned from account resource.
@@ -40,41 +39,43 @@ func NewAccountResource(store AccountStore) *AccountResource {
 	}
 }
 
-func (rs *AccountResource) router() *chi.Mux {
-	r := chi.NewRouter()
-	r.Get("/", rs.list)
-	r.Post("/", rs.create)
-	r.Route("/{accountID}", func(r chi.Router) {
-		r.Use(rs.accountCtx)
-		r.Get("/", rs.get)
-		r.Put("/", rs.update)
-		r.Delete("/", rs.delete)
-	})
-	return r
+func (rs *AccountResource) router(r *gin.RouterGroup) {
+	r.GET("", rs.list)
+	r.GET("/", rs.list)
+	r.POST("", rs.create)
+	r.POST("/", rs.create)
+
+	account := r.Group("/:accountID")
+	account.Use(rs.accountCtx)
+	account.GET("", rs.get)
+	account.GET("/", rs.get)
+	account.PUT("", rs.update)
+	account.PUT("/", rs.update)
+	account.DELETE("", rs.delete)
+	account.DELETE("/", rs.delete)
 }
 
-func (rs *AccountResource) accountCtx(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		id, err := strconv.Atoi(chi.URLParam(r, "accountID"))
-		if err != nil {
-			render.Render(w, r, ErrBadRequest)
-			return
-		}
-		account, err := rs.Store.Get(id)
-		if err != nil {
-			render.Render(w, r, ErrNotFound)
-			return
-		}
-		ctx := context.WithValue(r.Context(), ctxAccount, account)
-		next.ServeHTTP(w, r.WithContext(ctx))
-	})
+func (rs *AccountResource) accountCtx(c *gin.Context) {
+	id, err := strconv.Atoi(c.Param("accountID"))
+	if err != nil {
+		ErrBadRequest.Render(c)
+		return
+	}
+	account, err := rs.Store.Get(id)
+	if err != nil {
+		ErrNotFound.Render(c)
+		return
+	}
+	ctx := context.WithValue(c.Request.Context(), ctxAccount, account)
+	c.Request = c.Request.WithContext(ctx)
+	c.Next()
 }
 
 type accountRequest struct {
 	*pwdless.Account
 }
 
-func (d *accountRequest) Bind(r *http.Request) error {
+func (d *accountRequest) Bind(c *gin.Context) error {
 	return nil
 }
 
@@ -100,70 +101,70 @@ func newAccountListResponse(a *[]pwdless.Account, count int) *accountListRespons
 	return resp
 }
 
-func (rs *AccountResource) list(w http.ResponseWriter, r *http.Request) {
-	f, err := database.NewAccountFilter(r.URL.Query())
+func (rs *AccountResource) list(c *gin.Context) {
+	f, err := database.NewAccountFilter(c.Request.URL.Query())
 	if err != nil {
-		render.Render(w, r, ErrRender(err))
+		ErrRender(err).Render(c)
 		return
 	}
 	al, count, err := rs.Store.List(f)
 	if err != nil {
-		render.Render(w, r, ErrRender(err))
+		ErrRender(err).Render(c)
 		return
 	}
-	render.Respond(w, r, newAccountListResponse(&al, count))
+	respond(c, newAccountListResponse(&al, count))
 }
 
-func (rs *AccountResource) create(w http.ResponseWriter, r *http.Request) {
+func (rs *AccountResource) create(c *gin.Context) {
 	data := &accountRequest{}
-	if err := render.Bind(r, data); err != nil {
-		render.Render(w, r, ErrInvalidRequest(err))
+	if err := bind(c, data); err != nil {
+		ErrInvalidRequest(err).Render(c)
 		return
 	}
 
 	if err := rs.Store.Create(data.Account); err != nil {
 		switch err := err.(type) {
 		case validation.Errors:
-			render.Render(w, r, ErrValidation(ErrAccountValidation, err))
+			ErrValidation(ErrAccountValidation, err).Render(c)
 			return
 		}
-		render.Render(w, r, ErrInvalidRequest(err))
+		ErrInvalidRequest(err).Render(c)
 		return
 	}
-	render.Respond(w, r, newAccountResponse(data.Account))
+	respond(c, newAccountResponse(data.Account))
 }
 
-func (rs *AccountResource) get(w http.ResponseWriter, r *http.Request) {
-	acc := r.Context().Value(ctxAccount).(*pwdless.Account)
-	render.Respond(w, r, newAccountResponse(acc))
+func (rs *AccountResource) get(c *gin.Context) {
+	acc := c.Request.Context().Value(ctxAccount).(*pwdless.Account)
+	respond(c, newAccountResponse(acc))
 }
 
-func (rs *AccountResource) update(w http.ResponseWriter, r *http.Request) {
-	acc := r.Context().Value(ctxAccount).(*pwdless.Account)
+func (rs *AccountResource) update(c *gin.Context) {
+	acc := c.Request.Context().Value(ctxAccount).(*pwdless.Account)
 	data := &accountRequest{Account: acc}
-	if err := render.Bind(r, data); err != nil {
-		render.Render(w, r, ErrInvalidRequest(err))
+	if err := bind(c, data); err != nil {
+		ErrInvalidRequest(err).Render(c)
 		return
 	}
 
 	if err := rs.Store.Update(acc); err != nil {
 		switch err := err.(type) {
 		case validation.Errors:
-			render.Render(w, r, ErrValidation(ErrAccountValidation, err))
+			ErrValidation(ErrAccountValidation, err).Render(c)
 			return
 		}
-		render.Render(w, r, ErrInvalidRequest(err))
+		ErrInvalidRequest(err).Render(c)
 		return
 	}
 
-	render.Respond(w, r, newAccountResponse(acc))
+	respond(c, newAccountResponse(acc))
 }
 
-func (rs *AccountResource) delete(w http.ResponseWriter, r *http.Request) {
-	acc := r.Context().Value(ctxAccount).(*pwdless.Account)
+func (rs *AccountResource) delete(c *gin.Context) {
+	acc := c.Request.Context().Value(ctxAccount).(*pwdless.Account)
 	if err := rs.Store.Delete(acc); err != nil {
-		render.Render(w, r, ErrInvalidRequest(err))
+		ErrInvalidRequest(err).Render(c)
 		return
 	}
-	render.Respond(w, r, http.NoBody)
+	respond(c, http.NoBody)
 }

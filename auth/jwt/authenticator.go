@@ -2,12 +2,9 @@ package jwt
 
 import (
 	"context"
-	"net/http"
 
+	"github.com/gin-gonic/gin"
 	"github.com/lestrrat-go/jwx/v2/jwt"
-
-	"github.com/go-chi/jwtauth/v5"
-	"github.com/go-chi/render"
 
 	"github.com/dhax/go-base/logging"
 )
@@ -32,61 +29,59 @@ func RefreshTokenFromCtx(ctx context.Context) string {
 // Authenticator is a default authentication middleware to enforce access from the
 // Verifier middleware request context values. The Authenticator sends a 401 Unauthorized
 // response for any unverified tokens and passes the good ones through.
-func Authenticator(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		token, claims, err := jwtauth.FromContext(r.Context())
+func Authenticator(c *gin.Context) {
+	token, claims, err := tokenFromContext(c.Request.Context())
 
-		if err != nil {
-			logging.GetLogEntry(r).Warn(err)
-			render.Render(w, r, ErrUnauthorized(ErrTokenUnauthorized))
-			return
-		}
+	if err != nil {
+		logging.GetLogEntry(c.Request).Warn(err)
+		ErrUnauthorized(ErrTokenUnauthorized).Render(c)
+		return
+	}
 
-		if err := jwt.Validate(token); err != nil {
-			render.Render(w, r, ErrUnauthorized(ErrTokenExpired))
-			return
-		}
+	if err := jwt.Validate(token); err != nil {
+		ErrUnauthorized(ErrTokenExpired).Render(c)
+		return
+	}
 
-		// Token is authenticated, parse claims
-		var c AppClaims
-		err = c.ParseClaims(claims)
-		if err != nil {
-			logging.GetLogEntry(r).Error(err)
-			render.Render(w, r, ErrUnauthorized(ErrInvalidAccessToken))
-			return
-		}
+	// Token is authenticated, parse claims
+	var cl AppClaims
+	err = cl.ParseClaims(claims)
+	if err != nil {
+		logging.GetLogEntry(c.Request).Error(err)
+		ErrUnauthorized(ErrInvalidAccessToken).Render(c)
+		return
+	}
 
-		// Set AppClaims on context
-		ctx := context.WithValue(r.Context(), ctxClaims, c)
-		next.ServeHTTP(w, r.WithContext(ctx))
-	})
+	// Set AppClaims on context
+	ctx := context.WithValue(c.Request.Context(), ctxClaims, cl)
+	c.Request = c.Request.WithContext(ctx)
+	c.Next()
 }
 
 // AuthenticateRefreshJWT checks validity of refresh tokens and is only used for access token refresh and logout requests. It responds with 401 Unauthorized for invalid or expired refresh tokens.
-func AuthenticateRefreshJWT(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		token, claims, err := jwtauth.FromContext(r.Context())
-		if err != nil {
-			logging.GetLogEntry(r).Warn(err)
-			render.Render(w, r, ErrUnauthorized(ErrTokenUnauthorized))
-			return
-		}
+func AuthenticateRefreshJWT(c *gin.Context) {
+	token, claims, err := tokenFromContext(c.Request.Context())
+	if err != nil {
+		logging.GetLogEntry(c.Request).Warn(err)
+		ErrUnauthorized(ErrTokenUnauthorized).Render(c)
+		return
+	}
 
-		if err := jwt.Validate(token); err != nil {
-			render.Render(w, r, ErrUnauthorized(ErrTokenExpired))
-			return
-		}
+	if err := jwt.Validate(token); err != nil {
+		ErrUnauthorized(ErrTokenExpired).Render(c)
+		return
+	}
 
-		// Token is authenticated, parse refresh token string
-		var c RefreshClaims
-		err = c.ParseClaims(claims)
-		if err != nil {
-			logging.GetLogEntry(r).Error(err)
-			render.Render(w, r, ErrUnauthorized(ErrInvalidRefreshToken))
-			return
-		}
-		// Set refresh token string on context
-		ctx := context.WithValue(r.Context(), ctxRefreshToken, c.Token)
-		next.ServeHTTP(w, r.WithContext(ctx))
-	})
+	// Token is authenticated, parse refresh token string
+	var cl RefreshClaims
+	err = cl.ParseClaims(claims)
+	if err != nil {
+		logging.GetLogEntry(c.Request).Error(err)
+		ErrUnauthorized(ErrInvalidRefreshToken).Render(c)
+		return
+	}
+	// Set refresh token string on context
+	ctx := context.WithValue(c.Request.Context(), ctxRefreshToken, cl.Token)
+	c.Request = c.Request.WithContext(ctx)
+	c.Next()
 }

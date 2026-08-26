@@ -3,7 +3,7 @@ package admin
 import (
 	"net/http"
 
-	"github.com/go-chi/render"
+	"github.com/gin-gonic/gin"
 	validation "github.com/go-ozzo/ozzo-validation"
 )
 
@@ -18,14 +18,14 @@ type ErrResponse struct {
 	ValidationErrors validation.Errors `json:"errors,omitempty"` // user level model validation errors
 }
 
-// Render sets the application-specific error code in AppCode.
-func (e *ErrResponse) Render(w http.ResponseWriter, r *http.Request) error {
-	render.Status(r, e.HTTPStatusCode)
-	return nil
+// Render responds with the application-specific error code and aborts the chain.
+func (e *ErrResponse) Render(c *gin.Context) {
+	c.Abort()
+	respondJSON(c, e.HTTPStatusCode, e)
 }
 
 // ErrInvalidRequest returns status 422 Unprocessable Entity including error message.
-func ErrInvalidRequest(err error) render.Renderer {
+func ErrInvalidRequest(err error) *ErrResponse {
 	return &ErrResponse{
 		Err:            err,
 		HTTPStatusCode: http.StatusUnprocessableEntity,
@@ -35,7 +35,7 @@ func ErrInvalidRequest(err error) render.Renderer {
 }
 
 // ErrRender returns status 422 Unprocessable Entity rendering response error.
-func ErrRender(err error) render.Renderer {
+func ErrRender(err error) *ErrResponse {
 	return &ErrResponse{
 		Err:            err,
 		HTTPStatusCode: http.StatusUnprocessableEntity,
@@ -45,7 +45,7 @@ func ErrRender(err error) render.Renderer {
 }
 
 // ErrValidation returns status 422 Unprocessable Entity stating validation errors.
-func ErrValidation(err error, valErr validation.Errors) render.Renderer {
+func ErrValidation(err error, valErr validation.Errors) *ErrResponse {
 	return &ErrResponse{
 		Err:              err,
 		HTTPStatusCode:   http.StatusUnprocessableEntity,

@@ -1,9 +1,10 @@
 package authorize
 
 import (
+	"encoding/json"
 	"net/http"
 
-	"github.com/go-chi/render"
+	"github.com/gin-gonic/gin"
 )
 
 // ErrResponse renderer type for handling all sorts of errors.
@@ -16,10 +17,10 @@ type ErrResponse struct {
 	ErrorText  string `json:"error,omitempty"` // application-level error message, for debugging
 }
 
-// Render sets the application-specific error code in AppCode.
-func (e *ErrResponse) Render(w http.ResponseWriter, r *http.Request) error {
-	render.Status(r, e.HTTPStatusCode)
-	return nil
+// Render responds with the application-specific error code and aborts the chain.
+func (e *ErrResponse) Render(c *gin.Context) {
+	c.Abort()
+	respondJSON(c, e.HTTPStatusCode, e)
 }
 
 // The list of default error types without specific error message.
@@ -29,3 +30,15 @@ var (
 		StatusText:     http.StatusText(http.StatusForbidden),
 	}
 )
+
+// respondJSON writes v as a JSON response body terminated by a newline.
+func respondJSON(c *gin.Context, status int, v any) {
+	body, err := json.Marshal(v)
+	if err != nil {
+		http.Error(c.Writer, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	c.Header("Content-Type", "application/json")
+	c.Status(status)
+	_, _ = c.Writer.Write(append(body, '\n'))
+}

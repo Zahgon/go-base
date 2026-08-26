@@ -2,12 +2,13 @@
 package logging
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"net/http"
 	"time"
 
-	"github.com/go-chi/chi/v5/middleware"
+	"github.com/gin-gonic/gin"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/viper"
 )
@@ -19,6 +20,11 @@ var Logger *logrus.Logger
 type StructuredLogger struct {
 	Logger *logrus.Logger
 }
+
+type logEntryCtxKeyType struct{}
+
+// LogEntryCtxKey is the request context key holding the request scoped log entry.
+var LogEntryCtxKey = logEntryCtxKeyType{}
 
 // NewLogger creates and configures a new logrus Logger.
 func NewLogger() *logrus.Logger {
@@ -46,18 +52,34 @@ func NewLogger() *logrus.Logger {
 }
 
 // NewStructuredLogger implements a custom structured logrus Logger.
-func NewStructuredLogger(logger *logrus.Logger) func(next http.Handler) http.Handler {
-	return middleware.RequestLogger(&StructuredLogger{Logger})
+func NewStructuredLogger(logger *logrus.Logger) gin.HandlerFunc {
+	l := &StructuredLogger{logger}
+	return func(c *gin.Context) {
+		entry := l.NewLogEntry(c.Request)
+		ctx := context.WithValue(c.Request.Context(), LogEntryCtxKey, entry)
+		c.Request = c.Request.WithContext(ctx)
+
+		t1 := time.Now()
+		defer func() {
+			status, written := c.Writer.Status(), c.Writer.Size()
+			if !c.Writer.Written() {
+				status, written = 0, 0
+			}
+			entry.Write(status, written, c.Writer.Header(), time.Since(t1), nil)
+		}()
+
+		c.Next()
+	}
 }
 
 // NewLogEntry sets default request log fields.
-func (l *StructuredLogger) NewLogEntry(r *http.Request) middleware.LogEntry {
+func (l *StructuredLogger) NewLogEntry(r *http.Request) *StructuredLoggerEntry {
 	entry := &StructuredLoggerEntry{Logger: logrus.NewEntry(l.Logger)}
 	logFields := logrus.Fields{}
 
 	logFields["ts"] = time.Now().UTC().Format(time.RFC1123)
 
-	if reqID := middleware.GetReqID(r.Context()); reqID != "" {
+	if reqID := requestIDFromRequest(r); reqID != "" {
 		logFields["req_id"] = reqID
 	}
 
@@ -111,20 +133,20 @@ func (l *StructuredLoggerEntry) Panic(v any, stack []byte) {
 
 // GetLogEntry return the request scoped logrus.FieldLogger.
 func GetLogEntry(r *http.Request) logrus.FieldLogger {
-	entry := middleware.GetLogEntry(r).(*StructuredLoggerEntry)
+	entry := r.Context().Value(LogEntryCtxKey).(*StructuredLoggerEntry)
 	return entry.Logger
 }
 
 // LogEntrySetField adds a field to the request scoped logrus.FieldLogger.
 func LogEntrySetField(r *http.Request, key string, value any) {
-	if entry, ok := r.Context().Value(middleware.LogEntryCtxKey).(*StructuredLoggerEntry); ok {
+	if entry, ok := r.Context().Value(LogEntryCtxKey).(*StructuredLoggerEntry); ok {
 		entry.Logger = entry.Logger.WithField(key, value)
 	}
 }
 
 // LogEntrySetFields adds multiple fields to the request scoped logrus.FieldLogger.
 func LogEntrySetFields(r *http.Request, fields map[string]any) {
-	if entry, ok := r.Context().Value(middleware.LogEntryCtxKey).(*StructuredLoggerEntry); ok {
+	if entry, ok := r.Context().Value(LogEntryCtxKey).(*StructuredLoggerEntry); ok {
 		entry.Logger = entry.Logger.WithFields(fields)
 	}
 }
