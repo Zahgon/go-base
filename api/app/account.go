@@ -7,12 +7,12 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/go-chi/chi/v5"
-	"github.com/go-chi/render"
+	"github.com/gin-gonic/gin"
 	validation "github.com/go-ozzo/ozzo-validation"
 
 	"github.com/dhax/go-base/auth/jwt"
 	"github.com/dhax/go-base/auth/pwdless"
+	"github.com/dhax/go-base/render"
 )
 
 // The list of error types returned from account resource.
@@ -41,32 +41,33 @@ func NewAccountResource(store AccountStore) *AccountResource {
 	}
 }
 
-func (rs *AccountResource) router() *chi.Mux {
-	r := chi.NewRouter()
+func (rs *AccountResource) router(r *gin.RouterGroup) {
 	r.Use(rs.accountCtx)
-	r.Get("/", rs.get)
-	r.Put("/", rs.update)
-	r.Delete("/", rs.delete)
-	r.Route("/token/{tokenID}", func(r chi.Router) {
-		r.Put("/", rs.updateToken)
-		r.Delete("/", rs.deleteToken)
-	})
-	return r
+	r.GET("", rs.get)
+	r.GET("/", rs.get)
+	r.PUT("", rs.update)
+	r.PUT("/", rs.update)
+	r.DELETE("", rs.delete)
+	r.DELETE("/", rs.delete)
+
+	token := r.Group("/token/:tokenID")
+	token.PUT("", rs.updateToken)
+	token.PUT("/", rs.updateToken)
+	token.DELETE("", rs.deleteToken)
+	token.DELETE("/", rs.deleteToken)
 }
 
-func (rs *AccountResource) accountCtx(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		claims := jwt.ClaimsFromCtx(r.Context())
-		log(r).WithField("account_id", claims.ID)
-		account, err := rs.Store.Get(claims.ID)
-		if err != nil {
-			// account deleted while access token still valid
-			render.Render(w, r, ErrUnauthorized)
-			return
-		}
-		ctx := context.WithValue(r.Context(), ctxAccount, account)
-		next.ServeHTTP(w, r.WithContext(ctx))
-	})
+func (rs *AccountResource) accountCtx(c *gin.Context) {
+	claims := jwt.ClaimsFromCtx(c.Request.Context())
+	log(c.Request).WithField("account_id", claims.ID)
+	account, err := rs.Store.Get(claims.ID)
+	if err != nil {
+		// account deleted while access token still valid
+		ErrUnauthorized.Render(c)
+		return
+	}
+	ctx := context.WithValue(c.Request.Context(), ctxAccount, account)
+	c.Request = c.Request.WithContext(ctx)
 }
 
 type accountRequest struct {
@@ -78,7 +79,7 @@ type accountRequest struct {
 	ProtectedRoles  []string `json:"roles"`
 }
 
-func (d *accountRequest) Bind(r *http.Request) error {
+func (d *accountRequest) Bind(c *gin.Context) error {
 	// d.ProtectedActive = true
 	// d.ProtectedRoles = []string{}
 	return nil
@@ -93,39 +94,39 @@ func newAccountResponse(a *pwdless.Account) *accountResponse {
 	return resp
 }
 
-func (rs *AccountResource) get(w http.ResponseWriter, r *http.Request) {
-	acc := r.Context().Value(ctxAccount).(*pwdless.Account)
-	render.Respond(w, r, newAccountResponse(acc))
+func (rs *AccountResource) get(c *gin.Context) {
+	acc := c.Request.Context().Value(ctxAccount).(*pwdless.Account)
+	render.Respond(c, newAccountResponse(acc))
 }
 
-func (rs *AccountResource) update(w http.ResponseWriter, r *http.Request) {
-	acc := r.Context().Value(ctxAccount).(*pwdless.Account)
+func (rs *AccountResource) update(c *gin.Context) {
+	acc := c.Request.Context().Value(ctxAccount).(*pwdless.Account)
 	data := &accountRequest{Account: acc}
-	if err := render.Bind(r, data); err != nil {
-		render.Render(w, r, ErrInvalidRequest(err))
+	if err := render.Bind(c, data); err != nil {
+		ErrInvalidRequest(err).Render(c)
 		return
 	}
 
 	if err := rs.Store.Update(acc); err != nil {
 		switch err := err.(type) {
 		case validation.Errors:
-			render.Render(w, r, ErrValidation(ErrAccountValidation, err))
+			ErrValidation(ErrAccountValidation, err).Render(c)
 			return
 		}
-		render.Render(w, r, ErrRender(err))
+		ErrRender(err).Render(c)
 		return
 	}
 
-	render.Respond(w, r, newAccountResponse(acc))
+	render.Respond(c, newAccountResponse(acc))
 }
 
-func (rs *AccountResource) delete(w http.ResponseWriter, r *http.Request) {
-	acc := r.Context().Value(ctxAccount).(*pwdless.Account)
+func (rs *AccountResource) delete(c *gin.Context) {
+	acc := c.Request.Context().Value(ctxAccount).(*pwdless.Account)
 	if err := rs.Store.Delete(acc); err != nil {
-		render.Render(w, r, ErrRender(err))
+		ErrRender(err).Render(c)
 		return
 	}
-	render.Respond(w, r, http.NoBody)
+	render.Respond(c, http.NoBody)
 }
 
 type tokenRequest struct {
@@ -133,48 +134,48 @@ type tokenRequest struct {
 	ProtectedID int `json:"id"`
 }
 
-func (d *tokenRequest) Bind(r *http.Request) error {
+func (d *tokenRequest) Bind(c *gin.Context) error {
 	d.Identifier = strings.TrimSpace(d.Identifier)
 	return nil
 }
 
-func (rs *AccountResource) updateToken(w http.ResponseWriter, r *http.Request) {
-	id, err := strconv.Atoi(chi.URLParam(r, "tokenID"))
+func (rs *AccountResource) updateToken(c *gin.Context) {
+	id, err := strconv.Atoi(c.Param("tokenID"))
 	if err != nil {
-		render.Render(w, r, ErrBadRequest)
+		ErrBadRequest.Render(c)
 		return
 	}
 	data := &tokenRequest{}
-	if err := render.Bind(r, data); err != nil {
-		render.Render(w, r, ErrInvalidRequest(err))
+	if err := render.Bind(c, data); err != nil {
+		ErrInvalidRequest(err).Render(c)
 		return
 	}
-	acc := r.Context().Value(ctxAccount).(*pwdless.Account)
+	acc := c.Request.Context().Value(ctxAccount).(*pwdless.Account)
 	for _, t := range acc.Token {
 		if t.ID == id {
 			if err := rs.Store.UpdateToken(&jwt.Token{
 				ID:         t.ID,
 				Identifier: data.Identifier,
 			}); err != nil {
-				render.Render(w, r, ErrInvalidRequest(err))
+				ErrInvalidRequest(err).Render(c)
 				return
 			}
 		}
 	}
-	render.Respond(w, r, http.NoBody)
+	render.Respond(c, http.NoBody)
 }
 
-func (rs *AccountResource) deleteToken(w http.ResponseWriter, r *http.Request) {
-	id, err := strconv.Atoi(chi.URLParam(r, "tokenID"))
+func (rs *AccountResource) deleteToken(c *gin.Context) {
+	id, err := strconv.Atoi(c.Param("tokenID"))
 	if err != nil {
-		render.Render(w, r, ErrBadRequest)
+		ErrBadRequest.Render(c)
 		return
 	}
-	acc := r.Context().Value(ctxAccount).(*pwdless.Account)
+	acc := c.Request.Context().Value(ctxAccount).(*pwdless.Account)
 	for _, t := range acc.Token {
 		if t.ID == id {
 			rs.Store.DeleteToken(&jwt.Token{ID: t.ID})
 		}
 	}
-	render.Respond(w, r, http.NoBody)
+	render.Respond(c, http.NoBody)
 }

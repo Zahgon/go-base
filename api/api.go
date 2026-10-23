@@ -2,9 +2,15 @@
 package api
 
 import (
+	"context"
+	"fmt"
 	"net/http"
 	"os"
 	"path"
+	"runtime/debug"
+	"slices"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -15,14 +21,26 @@ import (
 	"github.com/dhax/go-base/database"
 	"github.com/dhax/go-base/email"
 	"github.com/dhax/go-base/logging"
-	"github.com/go-chi/chi/v5"
-	"github.com/go-chi/chi/v5/middleware"
-	"github.com/go-chi/cors"
-	"github.com/go-chi/render"
+	"github.com/gin-gonic/gin"
+	"github.com/sirupsen/logrus"
 )
 
+// mountedPrefixes are the path prefixes served by a sub router. Requests below one of
+// them that match no route are answered by the sub router's not found handler.
+var mountedPrefixes = []string{"/auth", "/admin", "/api"}
+
+// protectedPrefixes are the path prefixes guarded by the JWT authenticator.
+var protectedPrefixes = []string{"/admin", "/api"}
+
+// knownMethods are the request methods the source router could route. It answered every other method with
+// 405 Method Not Allowed and no Allow header before running any route group middleware.
+var knownMethods = []string{
+	http.MethodGet, http.MethodHead, http.MethodPost, http.MethodPut, http.MethodPatch,
+	http.MethodDelete, http.MethodConnect, http.MethodOptions, http.MethodTrace,
+}
+
 // New configures application resources and routes.
-func New(enableCORS bool) (*chi.Mux, error) {
+func New(enableCORS bool) (*gin.Engine, error) {
 	logger := logging.NewLogger()
 
 	db, err := database.DBConn()
@@ -56,50 +74,358 @@ func New(enableCORS bool) (*chi.Mux, error) {
 		return nil, err
 	}
 
-	r := chi.NewRouter()
-	r.Use(middleware.Recoverer)
-	r.Use(middleware.RequestID)
-	// r.Use(middleware.RealIP)
-	r.Use(middleware.Timeout(15 * time.Second))
+	return newRouter(enableCORS, logger, authResource, adminAPI, appAPI), nil
+}
+
+// newRouter assembles the router from already configured resources. It is kept separate from
+// New so the routing behaviour can be exercised without a database connection.
+func newRouter(enableCORS bool, logger *logrus.Logger, authResource *pwdless.Resource, adminAPI *admin.API, appAPI *app.API) *gin.Engine {
+	gin.SetMode(gin.ReleaseMode)
+
+	r := gin.New()
+	r.RedirectTrailingSlash = false
+	r.RedirectFixedPath = false
+	r.HandleMethodNotAllowed = false
+	// The source router matched routes against the escaped path when the request carried one and passed
+	// path parameters on undecoded.
+	r.UseRawPath = true
+	r.UnescapePathValues = false
+
+	r.Use(recoverer)
+	r.Use(logging.RequestID())
+	// r.Use(logging.RealIP())
+	r.Use(timeout(15 * time.Second))
 
 	r.Use(logging.NewStructuredLogger(logger))
-	r.Use(render.SetContentType(render.ContentTypeJSON))
 
 	// use CORS middleware if client is not served by this api, e.g. from other domain or CDN
 	if enableCORS {
-		r.Use(corsConfig().Handler)
+		r.Use(corsConfig())
 	}
 
-	r.Mount("/auth", authResource.Router())
-	r.Group(func(r chi.Router) {
-		r.Use(authResource.TokenAuth.Verifier())
-		r.Use(jwt.Authenticator)
-		r.Mount("/admin", adminAPI.Router())
-		r.Mount("/api", appAPI.Router())
+	authResource.Router(r.Group("/auth"))
+
+	protected := r.Group("")
+	protected.Use(authResource.TokenAuth.Verifier())
+	protected.Use(jwt.Authenticator)
+	adminAPI.Router(protected.Group("/admin"))
+	appAPI.Router(protected.Group("/api"))
+
+	r.GET("/healthz", func(c *gin.Context) {
+		c.Writer.Write([]byte("ok"))
 	})
 
-	r.Get("/healthz", func(w http.ResponseWriter, _ *http.Request) {
-		w.Write([]byte("ok"))
-	})
+	spa := SPAHandler("public")
+	patterns := routePatterns(r)
+	r.NoRoute(
+		rejectUnknownMethod,
+		onlyBelow(protectedPrefixes, authResource.TokenAuth.Verifier()),
+		onlyBelow(protectedPrefixes, jwt.Authenticator),
+		mountScope("/admin", adminAPI.Scope),
+		mountScope("/api", appAPI.Scope),
+		func(c *gin.Context) {
+			// An asterisk-form request target matches no route, not even the catch-all.
+			if !strings.HasPrefix(routingPath(c.Request), "/") {
+				http.NotFound(c.Writer, c.Request)
+				return
+			}
+			allowed := allowedMethods(patterns, routingPath(c.Request))
+			if hasPrefix(routingPath(c.Request), mountedPrefixes) {
+				if len(allowed) == 0 {
+					http.NotFound(c.Writer, c.Request)
+					return
+				}
+				methodNotAllowed(c, allowed)
+				return
+			}
+			// The root serves a catch-all GET for the single page application, so every other
+			// method is reported as not allowed rather than not found.
+			if c.Request.Method != http.MethodGet {
+				methodNotAllowed(c, sortMethods(append(allowed, http.MethodGet)))
+				return
+			}
+			spa(c.Writer, c.Request)
+		},
+	)
 
-	r.Get("/*", SPAHandler("public"))
-
-	return r, nil
+	return r
 }
 
-func corsConfig() *cors.Cors {
+// recoverer answers a request whose handling panicked with 500 Internal Server Error and prints the panic
+// with its stack to standard error. Like the source router's recoverer it leaves the response alone for
+// requests asking for a connection upgrade, and lets http.ErrAbortHandler through to the server.
+func recoverer(c *gin.Context) {
+	w := c.Writer
+	defer func() {
+		rvr := recover()
+		if rvr == nil {
+			return
+		}
+		if rvr == http.ErrAbortHandler {
+			panic(rvr)
+		}
+		fmt.Fprintf(os.Stderr, "\npanic: %v\n\n%s\n", rvr, debug.Stack())
+		if c.Request.Header.Get("Connection") != "Upgrade" {
+			writeStatus(w, http.StatusInternalServerError)
+		} else if !w.Written() {
+			// Nothing is written, so the server answers 200 OK with an empty body, also on the fallback
+			// chain, where Gin would otherwise add its default not found body.
+			w.WriteHeader(http.StatusOK)
+		}
+		c.Abort()
+	}()
+	c.Next()
+}
+
+// timeout cancels the request context after the given duration and answers
+// 504 Gateway Timeout once the deadline has passed.
+func timeout(d time.Duration) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		w := c.Writer
+		ctx, cancel := context.WithTimeout(c.Request.Context(), d)
+		defer func() {
+			cancel()
+			if ctx.Err() == context.DeadlineExceeded {
+				writeStatus(w, http.StatusGatewayTimeout)
+			}
+		}()
+
+		c.Request = c.Request.WithContext(ctx)
+		c.Next()
+	}
+}
+
+// writeStatus writes a status code the way a plain net/http handler does: the header is sent at once, and
+// when a response header was already sent the call reaches the server's own response writer, which keeps
+// the first status and reports the superfluous call.
+func writeStatus(w gin.ResponseWriter, code int) {
+	if !w.Written() {
+		w.WriteHeader(code)
+		w.WriteHeaderNow()
+		return
+	}
+	if u, ok := w.(interface{ Unwrap() http.ResponseWriter }); ok {
+		u.Unwrap().WriteHeader(code)
+	}
+}
+
+// methodNotAllowed answers 405 Method Not Allowed with an empty body, advertising each allowed
+// method in its own Allow header as the source router did.
+func methodNotAllowed(c *gin.Context, allowed []string) {
+	for _, m := range allowed {
+		c.Writer.Header().Add("Allow", m)
+	}
+	c.Status(http.StatusMethodNotAllowed)
+	c.Writer.Write(nil)
+}
+
+// routePattern is a registered route split into path segments for matching.
+type routePattern struct {
+	segments []string
+	method   string
+}
+
+// routePatterns snapshots the engine's route table once all routes are registered.
+func routePatterns(engine *gin.Engine) []routePattern {
+	routes := engine.Routes()
+	sort.SliceStable(routes, func(i, j int) bool { return routes[i].Path < routes[j].Path })
+	patterns := make([]routePattern, 0, len(routes))
+	for _, route := range routes {
+		patterns = append(patterns, routePattern{segments: pathSegments(route.Path), method: route.Method})
+	}
+	return patterns
+}
+
+// pathSegments splits a path on the separator, keeping the empty final segment a trailing slash
+// produces. The source router treated "/auth/login" and "/auth/login/" as different paths, so
+// collapsing them here would answer 405 where the source answered 404.
+func pathSegments(p string) []string {
+	return strings.Split(strings.TrimPrefix(p, "/"), "/")
+}
+
+// allowedMethods returns the methods registered for the routes matching path, ignoring the request
+// method. Wildcard segments match any single segment, mirroring how the source router reported the
+// methods available on the node it reached.
+func allowedMethods(patterns []routePattern, path string) []string {
+	segments := pathSegments(path)
+	var allowed []string
+	for _, pattern := range patterns {
+		if !matchSegments(pattern.segments, segments) {
+			continue
+		}
+		if !slices.Contains(allowed, pattern.method) {
+			allowed = append(allowed, pattern.method)
+		}
+	}
+	return sortMethods(allowed)
+}
+
+// methodOrder is the order the Allow headers are emitted in. The source router derived the order
+// from a map iteration and so varied it between identical requests; this is the order it produced
+// most of the time, made deterministic.
+var methodOrder = []string{
+	http.MethodGet, http.MethodHead, http.MethodPost, http.MethodPut,
+	http.MethodPatch, http.MethodDelete, http.MethodConnect, http.MethodOptions, http.MethodTrace,
+}
+
+func sortMethods(methods []string) []string {
+	sort.SliceStable(methods, func(i, j int) bool {
+		return slices.Index(methodOrder, methods[i]) < slices.Index(methodOrder, methods[j])
+	})
+	return methods
+}
+
+func matchSegments(pattern, segments []string) bool {
+	if len(pattern) != len(segments) {
+		return false
+	}
+	for i, p := range pattern {
+		if strings.HasPrefix(p, ":") {
+			if segments[i] == "" {
+				return false
+			}
+			continue
+		}
+		if p != segments[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// hasPrefix reports whether path equals or is nested below one of the given prefixes.
+func hasPrefix(p string, prefixes []string) bool {
+	for _, prefix := range prefixes {
+		if p == prefix || strings.HasPrefix(p, prefix+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+// routingPath is the path the source router matched routes against: the escaped form when the request
+// carried one that differs from the decoded path, the decoded path otherwise.
+func routingPath(r *http.Request) string {
+	if r.URL.RawPath != "" {
+		return r.URL.RawPath
+	}
+	if r.URL.Path == "" {
+		// An authority-form target, as sent with CONNECT, is routed as the root path.
+		return "/"
+	}
+	return r.URL.Path
+}
+
+// rejectUnknownMethod answers a method the source router did not know with an empty 405 and no Allow header.
+func rejectUnknownMethod(c *gin.Context) {
+	if !slices.Contains(knownMethods, c.Request.Method) {
+		c.AbortWithStatus(http.StatusMethodNotAllowed)
+	}
+}
+
+// mountScope replays, for a request below prefix that matched no route, the middleware chain the mounted
+// router under prefix ran before its not found or method not allowed answer. The chain stops at the first
+// handler that aborts.
+func mountScope(prefix string, scope func(path string) []gin.HandlerFunc) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		p := routingPath(c.Request)
+		if !hasPrefix(p, []string{prefix}) {
+			return
+		}
+		for _, h := range scope(strings.TrimPrefix(p, prefix)) {
+			h(c)
+			if c.IsAborted() {
+				return
+			}
+		}
+	}
+}
+
+// onlyBelow runs the given handler for requests below one of the prefixes and skips it otherwise.
+func onlyBelow(prefixes []string, h gin.HandlerFunc) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if hasPrefix(routingPath(c.Request), prefixes) {
+			h(c)
+			return
+		}
+		c.Next()
+	}
+}
+
+// corsConfig returns the CORS middleware. Preflight answers echo the requested method and header
+// list instead of advertising the configured sets, and end the chain with an empty 200, which is
+// the contract the source enforced.
+func corsConfig() gin.HandlerFunc {
 	// Basic CORS
 	// for more ideas, see: https://developer.github.com/v3/#cross-origin-resource-sharing
-	return cors.New(cors.Options{
-		// AllowedOrigins: []string{"https://foo.com"}, // Use this to allow specific origin hosts
-		AllowedOrigins: []string{"*"},
-		// AllowOriginFunc:  func(r *http.Request, origin string) bool { return true },
-		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
-		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type", "X-CSRF-Token"},
-		ExposedHeaders:   []string{"Link"},
-		AllowCredentials: true,
-		MaxAge:           86400, // Maximum value not ignored by any of major browsers
-	})
+	allowedMethods := []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"}
+	allowedHeaders := []string{"Origin", "Accept", "Authorization", "Content-Type", "X-Csrf-Token"}
+	exposedHeaders := []string{"Link"}
+	// Maximum value not ignored by any of major browsers
+	const maxAge = 86400
+
+	return func(c *gin.Context) {
+		r := c.Request
+		headers := c.Writer.Header()
+		origin := r.Header.Get("Origin")
+		reqMethod := r.Header.Get("Access-Control-Request-Method")
+
+		if r.Method == http.MethodOptions && reqMethod != "" {
+			headers.Add("Vary", "Origin")
+			headers.Add("Vary", "Access-Control-Request-Method")
+			headers.Add("Vary", "Access-Control-Request-Headers")
+
+			reqHeaders := parseHeaderList(r.Header.Get("Access-Control-Request-Headers"))
+			if origin != "" && methodAllowed(allowedMethods, reqMethod) && headersAllowed(allowedHeaders, reqHeaders) {
+				headers.Set("Access-Control-Allow-Origin", "*")
+				headers.Set("Access-Control-Allow-Methods", strings.ToUpper(reqMethod))
+				if len(reqHeaders) > 0 {
+					headers.Set("Access-Control-Allow-Headers", strings.Join(reqHeaders, ", "))
+				}
+				headers.Set("Access-Control-Allow-Credentials", "true")
+				headers.Set("Access-Control-Max-Age", strconv.Itoa(maxAge))
+			}
+			c.AbortWithStatus(http.StatusOK)
+			return
+		}
+
+		headers.Add("Vary", "Origin")
+		if origin != "" && methodAllowed(allowedMethods, r.Method) {
+			headers.Set("Access-Control-Allow-Origin", "*")
+			headers.Set("Access-Control-Expose-Headers", strings.Join(exposedHeaders, ", "))
+			headers.Set("Access-Control-Allow-Credentials", "true")
+		}
+		c.Next()
+	}
+}
+
+// parseHeaderList splits and canonicalises an Access-Control-Request-Headers value.
+func parseHeaderList(list string) []string {
+	var out []string
+	for _, part := range strings.Split(list, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		out = append(out, http.CanonicalHeaderKey(part))
+	}
+	return out
+}
+
+// methodAllowed reports whether method may be used cross-origin. OPTIONS is always permitted
+// because it carries the preflight itself.
+func methodAllowed(allowed []string, method string) bool {
+	method = strings.ToUpper(method)
+	return method == http.MethodOptions || slices.Contains(allowed, method)
+}
+
+func headersAllowed(allowed, requested []string) bool {
+	for _, h := range requested {
+		if !slices.Contains(allowed, h) {
+			return false
+		}
+	}
+	return true
 }
 
 // SPAHandler serves the public Single Page Application.

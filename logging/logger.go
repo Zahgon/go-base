@@ -2,12 +2,13 @@
 package logging
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"net/http"
 	"time"
 
-	"github.com/go-chi/chi/v5/middleware"
+	"github.com/gin-gonic/gin"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/viper"
 )
@@ -19,6 +20,11 @@ var Logger *logrus.Logger
 type StructuredLogger struct {
 	Logger *logrus.Logger
 }
+
+type logEntryCtxKeyType struct{}
+
+// LogEntryCtxKey is the request context key holding the request scoped log entry.
+var LogEntryCtxKey = logEntryCtxKeyType{}
 
 // NewLogger creates and configures a new logrus Logger.
 func NewLogger() *logrus.Logger {
@@ -46,18 +52,77 @@ func NewLogger() *logrus.Logger {
 }
 
 // NewStructuredLogger implements a custom structured logrus Logger.
-func NewStructuredLogger(logger *logrus.Logger) func(next http.Handler) http.Handler {
-	return middleware.RequestLogger(&StructuredLogger{Logger})
+func NewStructuredLogger(logger *logrus.Logger) gin.HandlerFunc {
+	l := &StructuredLogger{logger}
+	return func(c *gin.Context) {
+		entry := l.NewLogEntry(c.Request)
+		ctx := context.WithValue(c.Request.Context(), LogEntryCtxKey, entry)
+		c.Request = c.Request.WithContext(ctx)
+
+		ww := &statusWriter{ResponseWriter: c.Writer}
+		c.Writer = ww
+
+		t1 := time.Now()
+		defer func() {
+			entry.Write(ww.status, ww.bytes, ww.Header(), time.Since(t1), nil)
+		}()
+
+		c.Next()
+	}
+}
+
+// statusWriter records the status code of the first response header written through it and the number of
+// body bytes written, so that a request answered with nothing, such as one that panicked, logs status 0.
+type statusWriter struct {
+	gin.ResponseWriter
+	status int
+	bytes  int
+}
+
+// WriteHeader records the first status code before passing it on.
+func (w *statusWriter) WriteHeader(code int) {
+	if w.status == 0 {
+		w.status = code
+	}
+	w.ResponseWriter.WriteHeader(code)
+}
+
+// WriteHeaderNow records the pending status code before writing the response header.
+func (w *statusWriter) WriteHeaderNow() {
+	if w.status == 0 {
+		w.status = w.ResponseWriter.Status()
+	}
+	w.ResponseWriter.WriteHeaderNow()
+}
+
+// Write records an implicit 200 OK and counts the body bytes written.
+func (w *statusWriter) Write(b []byte) (int, error) {
+	if w.status == 0 {
+		w.status = w.ResponseWriter.Status()
+	}
+	n, err := w.ResponseWriter.Write(b)
+	w.bytes += n
+	return n, err
+}
+
+// WriteString records an implicit 200 OK and counts the body bytes written.
+func (w *statusWriter) WriteString(s string) (int, error) {
+	if w.status == 0 {
+		w.status = w.ResponseWriter.Status()
+	}
+	n, err := w.ResponseWriter.WriteString(s)
+	w.bytes += n
+	return n, err
 }
 
 // NewLogEntry sets default request log fields.
-func (l *StructuredLogger) NewLogEntry(r *http.Request) middleware.LogEntry {
+func (l *StructuredLogger) NewLogEntry(r *http.Request) *StructuredLoggerEntry {
 	entry := &StructuredLoggerEntry{Logger: logrus.NewEntry(l.Logger)}
 	logFields := logrus.Fields{}
 
 	logFields["ts"] = time.Now().UTC().Format(time.RFC1123)
 
-	if reqID := middleware.GetReqID(r.Context()); reqID != "" {
+	if reqID := requestIDFromRequest(r); reqID != "" {
 		logFields["req_id"] = reqID
 	}
 
@@ -111,20 +176,20 @@ func (l *StructuredLoggerEntry) Panic(v any, stack []byte) {
 
 // GetLogEntry return the request scoped logrus.FieldLogger.
 func GetLogEntry(r *http.Request) logrus.FieldLogger {
-	entry := middleware.GetLogEntry(r).(*StructuredLoggerEntry)
+	entry := r.Context().Value(LogEntryCtxKey).(*StructuredLoggerEntry)
 	return entry.Logger
 }
 
 // LogEntrySetField adds a field to the request scoped logrus.FieldLogger.
 func LogEntrySetField(r *http.Request, key string, value any) {
-	if entry, ok := r.Context().Value(middleware.LogEntryCtxKey).(*StructuredLoggerEntry); ok {
+	if entry, ok := r.Context().Value(LogEntryCtxKey).(*StructuredLoggerEntry); ok {
 		entry.Logger = entry.Logger.WithField(key, value)
 	}
 }
 
 // LogEntrySetFields adds multiple fields to the request scoped logrus.FieldLogger.
 func LogEntrySetFields(r *http.Request, fields map[string]any) {
-	if entry, ok := r.Context().Value(middleware.LogEntryCtxKey).(*StructuredLoggerEntry); ok {
+	if entry, ok := r.Context().Value(LogEntryCtxKey).(*StructuredLoggerEntry); ok {
 		entry.Logger = entry.Logger.WithFields(fields)
 	}
 }

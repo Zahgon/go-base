@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/go-chi/chi/v5"
+	"github.com/gin-gonic/gin"
 	"github.com/spf13/viper"
 
 	"github.com/dhax/go-base/auth/jwt"
@@ -43,9 +43,10 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 
-	r := chi.NewRouter()
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
 	r.Use(logging.NewStructuredLogger(logging.NewLogger()))
-	r.Mount("/", auth.Router())
+	auth.Router(r.Group(""))
 
 	ts = httptest.NewServer(r)
 
@@ -86,6 +87,14 @@ func TestAuthResource_login(t *testing.T) {
 		{"valid", "valid@account.io", http.StatusOK, nil},
 	}
 
+	// The login handler sends the mail in the background, so the test waits for the send instead of
+	// checking the mock's flag right after the response.
+	sent := make(chan struct{}, 1)
+	mailer.SendFn = func(m email.Message) error {
+		sent <- struct{}{}
+		return nil
+	}
+
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			req, err := encode(&loginRequest{Email: tc.email})
@@ -103,11 +112,14 @@ func TestAuthResource_login(t *testing.T) {
 			if tc.err == ErrInvalidLogin && authStore.GetAccountByEmailInvoked {
 				t.Error("GetByLoginToken invoked for invalid email")
 			}
-			if tc.err == nil && !mailer.SendInvoked {
-				t.Error("emailService.Send not invoked")
+			if tc.err == nil {
+				select {
+				case <-sent:
+				case <-time.After(5 * time.Second):
+					t.Error("emailService.Send not invoked")
+				}
 			}
 			authStore.GetAccountByEmailInvoked = false
-			mailer.SendInvoked = false
 		})
 	}
 }

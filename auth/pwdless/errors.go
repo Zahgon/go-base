@@ -4,7 +4,8 @@ import (
 	"errors"
 	"net/http"
 
-	"github.com/go-chi/render"
+	"github.com/dhax/go-base/render"
+	"github.com/gin-gonic/gin"
 )
 
 // The list of error types presented to the end user as error message.
@@ -25,14 +26,14 @@ type ErrResponse struct {
 	ErrorText  string `json:"error,omitempty"` // application-level error message, for debugging
 }
 
-// Render sets the application-specific error code in AppCode.
-func (e *ErrResponse) Render(w http.ResponseWriter, r *http.Request) error {
-	render.Status(r, e.HTTPStatusCode)
-	return nil
+// Render responds with the application-specific error code set in HTTPStatusCode.
+func (e *ErrResponse) Render(c *gin.Context) {
+	c.Abort()
+	render.JSON(c, e.HTTPStatusCode, e)
 }
 
 // ErrUnauthorized renders status 401 Unauthorized with custom error message.
-func ErrUnauthorized(err error) render.Renderer {
+func ErrUnauthorized(err error) *ErrResponse {
 	return &ErrResponse{
 		Err:            err,
 		HTTPStatusCode: http.StatusUnauthorized,

@@ -3,8 +3,9 @@ package app
 
 import (
 	"net/http"
+	"strings"
 
-	"github.com/go-chi/chi/v5"
+	"github.com/gin-gonic/gin"
 	"github.com/sirupsen/logrus"
 	"github.com/uptrace/bun"
 
@@ -40,14 +41,28 @@ func NewAPI(db *bun.DB) (*API, error) {
 	return api, nil
 }
 
-// Router provides application routes.
-func (a *API) Router() *chi.Mux {
-	r := chi.NewRouter()
+// Router registers application routes on the given router group.
+func (a *API) Router(r *gin.RouterGroup) {
+	a.Account.router(r.Group("/account"))
+	a.Profile.router(r.Group("/profile"))
+}
 
-	r.Mount("/account", a.Account.router())
-	r.Mount("/profile", a.Profile.router())
+// Scope returns the middleware the source router ran for a request below the application mount point, given
+// the request path relative to that mount point. The mounted routers ran their middleware before deciding on a
+// not found or method not allowed answer, so the engine replays this chain for requests that match no route.
+func (a *API) Scope(path string) []gin.HandlerFunc {
+	switch {
+	case below(path, "/account"):
+		return []gin.HandlerFunc{a.Account.accountCtx}
+	case below(path, "/profile"):
+		return []gin.HandlerFunc{a.Profile.profileCtx}
+	}
+	return nil
+}
 
-	return r
+// below reports whether path equals prefix or is nested below it.
+func below(path, prefix string) bool {
+	return path == prefix || strings.HasPrefix(path, prefix+"/")
 }
 
 func log(r *http.Request) logrus.FieldLogger {
